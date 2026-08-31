@@ -231,6 +231,18 @@ def qdrant():
             collection_name=name,
             vectors_config=VectorParams(size=emb_dim(), distance=Distance.COSINE),
         )
+    # Qdrant Cloud verlangt fuer Filter (z.B. Loeschen nach Dateiname) ein
+    # Payload-Register auf dem Feld "source" - anlegen ist idempotent genug:
+    try:
+        from qdrant_client.models import PayloadSchemaType
+
+        base.create_payload_index(
+            collection_name=name,
+            field_name="source",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+    except Exception:  # noqa: BLE001
+        pass  # existiert bereits
     return base
 
 
