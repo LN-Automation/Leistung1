@@ -618,14 +618,85 @@ def _drive_download(svc, f: dict) -> tuple[str, bytes] | None:
 with tab_cloud:
     anbieter = st.radio(
         "Cloud-Anbieter",
-        ["Google Drive", "Microsoft OneDrive / SharePoint (bald verfügbar)"],
+        ["Google Drive", "Microsoft OneDrive"],
         horizontal=True,
     )
     if anbieter.startswith("Microsoft"):
-        st.info(
-            "Die Microsoft-Anbindung ist in Vorbereitung. Sie funktioniert nach demselben "
-            "Prinzip wie Google Drive und wird als Nächstes freigeschaltet."
+        st.caption(
+            "Schritt 1: In OneDrive Rechtsklick auf den Ordner -> Teilen -> "
+            "Linkeinstellungen: 'Jeder, der über den Link verfügt' (Anzeigen) -> Link kopieren."
         )
+        od_link = st.text_input("Schritt 2: OneDrive-Freigabelink einfügen")
+        if od_link and st.button("OneDrive-Ordner verbinden und indexieren", type="primary"):
+            import base64
+
+            import requests as _rq
+
+            def _od_share_id(url: str) -> str:
+                b = base64.urlsafe_b64encode(url.strip().encode()).decode().rstrip("=")
+                return "u!" + b
+
+            def _od_json(url: str) -> dict:
+                r = _rq.get(url, timeout=60)
+                if r.status_code != 200:
+                    raise RuntimeError(
+                        f"OneDrive-Fehler {r.status_code}. Ist der Link auf "
+                        f"'Jeder, der über den Link verfügt' gestellt? ({r.text[:150]})"
+                    )
+                return r.json()
+
+            def _od_children(share_id: str, path: str) -> list[dict]:
+                base = f"https://api.onedrive.com/v1.0/shares/{share_id}/driveItem"
+                url = base + (f":/{path}:/children" if path else "/children")
+                items: list[dict] = []
+                while url:
+                    data = _od_json(url)
+                    items.extend(data.get("value", []))
+                    url = data.get("@odata.nextLink")
+                return items
+
+            def _od_walk(share_id: str, path: str, files: list, limit: int = 300) -> None:
+                for it in _od_children(share_id, path):
+                    if "folder" in it:
+                        _od_walk(
+                            share_id,
+                            (path + "/" if path else "") + it["name"],
+                            files,
+                            limit,
+                        )
+                    else:
+                        files.append(it)
+                    if len(files) >= limit:
+                        return
+
+            try:
+                share_id = _od_share_id(od_link)
+                files: list = []
+                with st.spinner("Lese OneDrive-Ordner ..."):
+                    _od_walk(share_id, "", files)
+                if not files:
+                    st.warning("Keine Dateien gefunden - Link und Freigabe prüfen.")
+                else:
+                    total = 0
+                    prog = st.progress(0.0)
+                    for i, f in enumerate(files, start=1):
+                        dl = f.get("@microsoft.graph.downloadUrl") or f.get(
+                            "@content.downloadUrl"
+                        )
+                        if not dl:
+                            continue
+                        data = _rq.get(dl, timeout=120).content
+                        n = index_document(
+                            f["name"], data, quelle="OneDrive", api_key=api_key
+                        )
+                        total += n
+                        prog.progress(i / len(files), text=f"{f['name']}: {n} Abschnitte")
+                    st.success(
+                        f"Fertig - {total} Abschnitte aus {len(files)} OneDrive-Dateien indexiert."
+                    )
+                    st.rerun()
+            except Exception as e:  # noqa: BLE001
+                st.error(f"OneDrive-Verbindung fehlgeschlagen: {e}")
     else:
         sa_email = ""
         try:
