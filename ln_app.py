@@ -163,19 +163,26 @@ def get_embedder():
 def _voyage_embed(texts: list[str], input_type: str) -> list[list[float]]:
     import requests
 
+    import time
+
     out: list[list[float]] = []
-    for i in range(0, len(texts), 96):
-        batch = texts[i : i + 96]
-        r = requests.post(
-            VOYAGE_URL,
-            headers={"Authorization": f"Bearer {setting('VOYAGE_API_KEY')}"},
-            json={
-                "input": batch,
-                "model": setting("VOYAGE_MODEL", "voyage-3.5-lite"),
-                "input_type": input_type,
-            },
-            timeout=120,
-        )
+    for i in range(0, len(texts), 12):  # kleine Pakete: passt auch ins freie Voyage-Limit
+        batch = texts[i : i + 12]
+        for _versuch in range(10):
+            r = requests.post(
+                VOYAGE_URL,
+                headers={"Authorization": f"Bearer {setting('VOYAGE_API_KEY')}"},
+                json={
+                    "input": batch,
+                    "model": setting("VOYAGE_MODEL", "voyage-3.5-lite"),
+                    "input_type": input_type,
+                },
+                timeout=120,
+            )
+            if r.status_code == 429:
+                time.sleep(22)  # Voyage bremst (Free-Limit) -> warten und erneut
+                continue
+            break
         if r.status_code != 200:
             try:
                 j = r.json()
@@ -398,13 +405,16 @@ def index_document(filename: str, data: bytes, quelle: str, api_key: str = "") -
         return 0
 
     vectors = embed_passages([c["text"] for c in chunks])
-    client.upsert(
-        collection_name=current_collection(),
-        points=[
-            PointStruct(id=str(uuid.uuid4()), vector=v, payload=c)
-            for c, v in zip(chunks, vectors)
-        ],
-    )
+    points = [
+        PointStruct(id=str(uuid.uuid4()), vector=v, payload=c)
+        for c, v in zip(chunks, vectors)
+    ]
+    # In Päckchen speichern - Qdrant Cloud erlaubt max. 32 MB pro Sendung
+    for i in range(0, len(points), 64):
+        client.upsert(
+            collection_name=current_collection(),
+            points=points[i : i + 64],
+        )
     return len(chunks)
 
 
