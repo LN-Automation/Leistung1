@@ -34,13 +34,27 @@ def setting(name: str, default: str = "") -> str:
 
 # ----------------------------- Grund-Setup ---------------------------------
 
-st.set_page_config(page_title="LN Automation – Dokumenten-Agent", page_icon="🤖", layout="centered")
+# Favicon: das Logo, falls es im Ordner liegt – sonst als Rückfall das Emoji
+_LOGO_PFAD = Path(__file__).parent / "logo.png"
+st.set_page_config(
+    page_title="LN Automation – Dokumentensuche",
+    page_icon=str(_LOGO_PFAD) if _LOGO_PFAD.exists() else "🤖",
+    layout="centered",
+)
 
 # Streamlit-Menü, Deploy-Button und Footer ausblenden (cleaner Look für Kunden)
 st.markdown(
     """
     <style>
-      #MainMenu, footer, .stAppDeployButton, [data-testid="stToolbar"] {visibility: hidden;}
+      /* Menü und Deploy-Button weg – aber NICHT der Header: dort sitzt der
+         Aufklapp-Pfeil der Sidebar. */
+      #MainMenu, footer, .stAppDeployButton, [data-testid="stStatusWidget"] {visibility: hidden;}
+      [data-testid="stHeader"] {background: transparent;}
+      [data-testid="stSidebarCollapsedControl"],
+      [data-testid="collapsedControl"] {
+        display: flex !important; visibility: visible !important;
+        opacity: 1 !important; pointer-events: auto !important; z-index: 99999 !important;
+      }
       .block-container {padding-top: 2.2rem;}
       .ln-section {
         font-size: 0.82rem; letter-spacing: 0.12em; text-transform: uppercase;
@@ -50,6 +64,31 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+def _logo_b64() -> str:
+    """Logo als Base64 – damit es sich in HTML zentrieren lässt."""
+    import base64
+
+    if _LOGO_PFAD.exists():
+        return base64.b64encode(_LOGO_PFAD.read_bytes()).decode()
+    return ""
+
+
+_logo = _logo_b64()
+
+
+def _logo_block(breite: int = 230, untertitel: str = "") -> str:
+    """HTML-Kopf mit zentriertem Logo. Ohne Logo-Datei: Schriftzug."""
+    inneres = (
+        f'<img src="data:image/png;base64,{_logo}" style="width:{breite}px;max-width:70%;" />'
+        if _logo else
+        '<div style="color:#0f172a;font-size:2rem;font-weight:800;">LN Automation</div>'
+    )
+    unter = (f'<div style="color:#64748b;font-size:1.0rem;margin-top:4px;">{untertitel}</div>'
+             if untertitel else "")
+    return (f'<div style="text-align:center;padding:10px 0 6px 0;margin-bottom:10px;">'
+            f'{inneres}{unter}</div>')
 
 
 def _slug(name: str) -> str:
@@ -67,11 +106,16 @@ except Exception:
 _app_pw = setting("APP_PASSWORD")
 
 if (_kunden or _app_pw) and not st.session_state.get("auth_ok"):
-    st.markdown("### LN Automation – Anmeldung")
+    st.markdown(
+        _logo_block(210, "Enterprise KI-Dokumenten- und Datensuche für den Mittelstand")
+        + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 1.6rem 0;" />',
+        unsafe_allow_html=True,
+    )
     with st.form("login"):
+        st.markdown("**Anmeldung**")
         firma = st.text_input("Firmen-Kennung") if _kunden else ""
         pw = st.text_input("Zugangspasswort", type="password")
-        if st.form_submit_button("Anmelden", type="primary"):
+        if st.form_submit_button("Anmelden", type="primary", width="stretch"):
             if _kunden:
                 f = firma.strip().lower()
                 if f in _kunden and pw == _kunden[f]:
@@ -89,41 +133,12 @@ if (_kunden or _app_pw) and not st.session_state.get("auth_ok"):
     st.stop()
 
 
-def _logo_b64() -> str:
-    import base64
-
-    p = Path(__file__).parent / "logo.png"
-    if p.exists():
-        return base64.b64encode(p.read_bytes()).decode()
-    return ""
-
-
-_logo = _logo_b64()
-if _logo:
-    st.markdown(
-        f"""
-        <div style="text-align:center;padding:10px 0 6px 0;margin-bottom:10px;">
-          <img src="data:image/png;base64,{_logo}" style="width:230px;max-width:70%;" />
-          <div style="color:#64748b;font-size:1.0rem;margin-top:2px;">
-            Enterprise KI-Dokumenten- und Datensuche für den Mittelstand
-          </div>
-        </div>
-        <hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 1.4rem 0;" />
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        """
-        <div style="text-align:center;padding:14px 0;">
-          <div style="color:#0f172a;font-size:2rem;font-weight:800;">LN Automation</div>
-          <div style="color:#64748b;font-size:1.0rem;margin-top:4px;">
-            Enterprise KI-Dokumenten- und Datensuche für den Mittelstand
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+# Kopfbereich – gleicher Baustein wie auf der Anmeldeseite
+st.markdown(
+    _logo_block(230, "Enterprise KI-Dokumenten- und Datensuche für den Mittelstand")
+    + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 1.4rem 0;" />',
+    unsafe_allow_html=True,
+)
 
 COLLECTION = "dokumente"
 EMB_MODEL = "intfloat/multilingual-e5-base"
