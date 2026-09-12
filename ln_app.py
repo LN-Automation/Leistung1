@@ -46,12 +46,18 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      /* Menü und Deploy-Button weg – aber NICHT der Header: dort sitzt der
-         Aufklapp-Pfeil der Sidebar. */
-      #MainMenu, footer, .stAppDeployButton, [data-testid="stStatusWidget"] {visibility: hidden;}
+      /* Menü, Deploy-Button und die Cloud-Leiste ("Fork", GitHub) ausblenden.
+         Der Header selbst bleibt bestehen, weil dort der Aufklapp-Pfeil der
+         Sidebar sitzt – dieser wird darunter gezielt wieder sichtbar gemacht.
+         visibility: visible beim Kind schlaegt visibility: hidden beim Eltern-Element. */
+      #MainMenu, footer, .stAppDeployButton, [data-testid="stStatusWidget"],
+      [data-testid="stToolbar"], [data-testid="stToolbarActions"],
+      [data-testid="stAppToolbar"], .stAppToolbar {visibility: hidden;}
       [data-testid="stHeader"] {background: transparent;}
       [data-testid="stSidebarCollapsedControl"],
-      [data-testid="collapsedControl"] {
+      [data-testid="stSidebarCollapsedControl"] *,
+      [data-testid="collapsedControl"],
+      [data-testid="collapsedControl"] * {
         display: flex !important; visibility: visible !important;
         opacity: 1 !important; pointer-events: auto !important; z-index: 99999 !important;
       }
