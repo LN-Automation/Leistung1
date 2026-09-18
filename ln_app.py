@@ -16,6 +16,8 @@ import io
 import uuid
 from pathlib import Path
 
+from datetime import datetime
+
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -93,8 +95,12 @@ def _logo_block(breite: int = 230, untertitel: str = "") -> str:
     )
     unter = (f'<div style="color:#64748b;font-size:1.0rem;margin-top:4px;">{untertitel}</div>'
              if untertitel else "")
-    return (f'<div style="text-align:center;padding:10px 0 6px 0;margin-bottom:10px;">'
-            f'{inneres}{unter}</div>')
+    # Linie bewusst nur unter dem Schriftzug statt über die ganze Breite
+    return (f'<div style="text-align:center;padding:26px 0 10px 0;">'
+            f'{inneres}{unter}'
+            f'<hr style="border:none;border-top:1px solid #e2e8f0;'
+            f'width:min(560px,60%);margin:22px auto 0 auto;" />'
+            f'</div>')
 
 
 def _slug(name: str) -> str:
@@ -113,8 +119,7 @@ _app_pw = setting("APP_PASSWORD")
 
 if (_kunden or _app_pw) and not st.session_state.get("auth_ok"):
     st.markdown(
-        _logo_block(210, "Enterprise KI-Dokumenten- und Datensuche für den Mittelstand")
-        + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 1.6rem 0;" />',
+        _logo_block(210, "Enterprise KI-Dokumenten- und Datensuche für den Mittelstand"),
         unsafe_allow_html=True,
     )
     with st.form("login"):
@@ -142,7 +147,7 @@ if (_kunden or _app_pw) and not st.session_state.get("auth_ok"):
 # Kopfbereich – gleicher Baustein wie auf der Anmeldeseite
 st.markdown(
     _logo_block(230, "Enterprise KI-Dokumenten- und Datensuche für den Mittelstand")
-    + '<hr style="border:none;border-top:1px solid #e2e8f0;margin:0 0 1.4rem 0;" />',
+    + '<div style="height:26px;"></div>',
     unsafe_allow_html=True,
 )
 
@@ -402,6 +407,35 @@ def chunk(text: str) -> list[str]:
 
 # ----------------------------- Indexierung ----------------------------------
 
+def inhalt_hash(data: bytes) -> str:
+    """Fingerabdruck des Dateiinhalts – erkennt dieselbe Datei unter
+    anderem Namen, etwa „Vertrag.pdf" und „Vertrag (1).pdf"."""
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def dublette(data: bytes, dateiname: str) -> str | None:
+    """Liefert den Namen des bereits indexierten Dokuments mit gleichem
+    Inhalt, sonst None."""
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    try:
+        client = qdrant()
+        pts, _ = client.scroll(
+            collection_name=current_collection(), limit=1, with_payload=True,
+            scroll_filter=Filter(must=[FieldCondition(
+                key="hash", match=MatchValue(value=inhalt_hash(data)))]),
+        )
+        for p_ in pts:
+            vorhanden = p_.payload.get("source")
+            if vorhanden and vorhanden != dateiname:
+                return vorhanden
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def index_document(filename: str, data: bytes, quelle: str, api_key: str = "") -> int:
     from qdrant_client.models import (
         FieldCondition,
@@ -421,7 +455,9 @@ def index_document(filename: str, data: bytes, quelle: str, api_key: str = "") -
     chunks: list[dict] = []
     for page_label, text in extract_text(filename, data, api_key):
         for piece in chunk(text):
-            chunks.append({"source": filename, "page": page_label, "text": piece, "herkunft": quelle})
+            chunks.append({"source": filename, "page": page_label,
+                           "text": piece, "herkunft": quelle,
+                           "hash": inhalt_hash(data)})
     if not chunks:
         return 0
 
@@ -478,46 +514,268 @@ def clear_all() -> None:
 
 # ------------------------------- Suche + KI ---------------------------------
 
-def ask_claude(question: str, api_key: str) -> tuple[str, list[dict]]:
-    from anthropic import Anthropic
+MODELL = "claude-sonnet-4-6"
+MODELL_KLEIN = "claude-haiku-4-5"      # nur zum Umformulieren von Folgefragen
+MIN_SCORE = 0.30                       # darunter gilt ein Treffer als unbrauchbar
+REL_ANTEIL = 0.55                      # Treffer unter 55 % des besten fallen raus
 
+
+def suchanfrage(frage: str, verlauf: list[dict], api_key: str) -> str:
+    """Folgefragen in eine eigenständige Suchanfrage umschreiben.
+
+    „Und was zur Haftung?" findet für sich genommen nichts. Ohne diesen
+    Schritt sucht die Vektorsuche wörtlich nach dem Fragment und liefert
+    die falschen Abschnitte.
+    """
+    if not verlauf:
+        return frage
+    letzte = verlauf[-6:]
+    gespraech = "\n".join(
+        f"{'Frage' if m['role'] == 'user' else 'Antwort'}: {m['content'][:400]}"
+        for m in letzte
+    )
+    try:
+        from anthropic import Anthropic
+
+        msg = Anthropic(api_key=api_key).messages.create(
+            model=MODELL_KLEIN,
+            max_tokens=150,
+            system=("Formuliere die letzte Frage so um, dass sie ohne den "
+                    "Gesprächsverlauf verständlich ist. Nur die umformulierte "
+                    "Frage ausgeben, nichts sonst. Ist die Frage bereits "
+                    "eigenständig, gib sie unverändert zurück."),
+            messages=[{"role": "user",
+                       "content": f"Bisheriges Gespräch:\n{gespraech}\n\n"
+                                  f"Letzte Frage: {frage}"}],
+        )
+        neu_text = "".join(b.text for b in msg.content if b.type == "text").strip()
+        return neu_text or frage
+    except Exception:  # noqa: BLE001 – im Zweifel die Originalfrage
+        return frage
+
+
+def belegstellen(question: str, api_key: str, verlauf: list[dict] | None = None,
+                 nur_quellen: list[str] | None = None) -> tuple[str, list[dict], str]:
+    """Passende Abschnitte suchen.
+
+    Liefert (Kontext für das Modell, Belegstellen, Hinweis). Ist der Hinweis
+    gefüllt, gibt es keine brauchbaren Treffer und es wird gar nicht gefragt.
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+    verlauf = verlauf or []
     client = qdrant()
 
-    qvec = embed_query(question)
+    gesucht = suchanfrage(question, verlauf, api_key)
+    qvec = embed_query(gesucht)
+    bedingung = None
+    if nur_quellen:
+        bedingung = Filter(must=[FieldCondition(key="source",
+                                                match=MatchAny(any=nur_quellen))])
     hits = client.query_points(
-        collection_name=current_collection(), query=qvec, limit=TOP_K, with_payload=True
+        collection_name=current_collection(), query=qvec, limit=TOP_K,
+        with_payload=True, query_filter=bedingung,
     ).points
     if not hits:
-        return "Es sind noch keine Dokumente indexiert.", []
+        return "", [], "Es sind noch keine passenden Dokumente indexiert."
+
+    # Schwelle: schwache Treffer fliegen raus, statt dass die KI aus
+    # unpassenden Auszügen etwas zusammenreimt.
+    bester = max(h.score for h in hits)
+    hits = [h for h in hits
+            if h.score >= MIN_SCORE and h.score >= bester * REL_ANTEIL]
+    if not hits:
+        return "", [], (
+            "Dazu steht nichts in den indexierten Dokumenten. Die Suche hat "
+            "keinen ausreichend passenden Abschnitt gefunden – bitte die Frage "
+            "anders formulieren oder das passende Dokument ergänzen."
+        )
 
     context = "\n\n".join(
-        f'<auszug quelle="{h.payload["source"]}" seite="{h.payload["page"]}">\n{h.payload["text"]}\n</auszug>'
+        f'<auszug quelle="{h.payload["source"]}" seite="{h.payload["page"]}">\n'
+        f'{h.payload["text"]}\n</auszug>'
         for h in hits
     )
-    system = (
-        "Du bist der Dokumentenassistent von LN Automation. Beantworte Fragen "
-        "AUSSCHLIESSLICH auf Basis der bereitgestellten Dokumentauszüge. Gib bei jeder "
-        "Aussage die Quelle an im Format [Dateiname, Seite]. Zahlen und Beträge exakt "
-        "wiedergeben. Wenn die Auszüge die Frage nicht beantworten, sage das klar und "
-        "rate nicht. Antworte auf Deutsch. Formatierung: normaler Fließtext, bei "
-        "Aufzählungen einfache Spiegelstriche; verwende NIEMALS Markdown-Überschriften "
-        "(#, ##) und kein übermäßiges Fettdruck-Formatieren."
-    )
-    msg = Anthropic(api_key=api_key).messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1500,
-        system=system,
-        messages=[{"role": "user", "content": f"Dokumentauszüge:\n\n{context}\n\nFrage: {question}"}],
-    )
-    answer = "".join(b.text for b in msg.content if b.type == "text")
-
-    sources, seen = [], set()
+    quellen, gesehen = [], set()
     for h in hits:
         key = (h.payload["source"], h.payload["page"])
-        if key not in seen:
-            seen.add(key)
-            sources.append({"source": key[0], "page": key[1], "score": round(h.score, 3)})
-    return answer, sources
+        if key not in gesehen:
+            gesehen.add(key)
+            quellen.append({
+                "source": key[0], "page": key[1], "score": round(h.score, 3),
+                "text": (h.payload.get("text") or "")[:600],
+            })
+    return context, quellen, ""
+
+
+SYSTEM_PROMPT = (
+    "Du bist der Dokumentenassistent von LN Automation. Beantworte Fragen "
+    "AUSSCHLIESSLICH auf Basis der bereitgestellten Dokumentauszüge. Gib bei jeder "
+    "Aussage die Quelle an im Format [Dateiname, Seite]. Zahlen und Beträge exakt "
+    "wiedergeben. Wenn die Auszüge die Frage nicht beantworten, sage das klar und "
+    "rate nicht. Antworte auf Deutsch. Formatierung: normaler Fließtext, bei "
+    "Aufzählungen einfache Spiegelstriche; verwende NIEMALS Markdown-Überschriften "
+    "(#, ##) und kein übermäßiges Fettdruck-Formatieren."
+)
+
+
+def antwort_stream(question: str, context: str, verlauf: list[dict],
+                   api_key: str, ergebnis: dict):
+    """Antwort stückweise liefern, damit nicht 20 Sekunden nur ein Spinner
+    läuft. Der Tokenverbrauch landet danach in `ergebnis`."""
+    from anthropic import Anthropic
+
+    nachrichten = [{"role": m["role"], "content": m["content"]}
+                   for m in (verlauf or [])[-8:]]
+    nachrichten.append({
+        "role": "user",
+        "content": f"Dokumentauszüge:\n\n{context}\n\nFrage: {question}",
+    })
+    with Anthropic(api_key=api_key).messages.stream(
+        model=MODELL, max_tokens=1500, system=SYSTEM_PROMPT,
+        messages=nachrichten,
+    ) as strom:
+        for stueck in strom.text_stream:
+            yield stueck
+        ergebnis["usage"] = getattr(strom.get_final_message(), "usage", None)
+
+
+def ask_claude(question: str, api_key: str, verlauf: list[dict] | None = None,
+               nur_quellen: list[str] | None = None) -> tuple[str, list[dict], dict]:
+    """Ohne Streaming – bleibt für Aufrufe von außen erhalten."""
+    from anthropic import Anthropic
+
+    from ln_nutzung import datensatz
+
+    context, quellen, hinweis = belegstellen(question, api_key, verlauf,
+                                             nur_quellen)
+    if hinweis:
+        return hinweis, [], datensatz("frage", MODELL, None)
+
+    nachrichten = [{"role": m["role"], "content": m["content"]}
+                   for m in (verlauf or [])[-8:]]
+    nachrichten.append({
+        "role": "user",
+        "content": f"Dokumentauszüge:\n\n{context}\n\nFrage: {question}",
+    })
+    msg = Anthropic(api_key=api_key).messages.create(
+        model=MODELL, max_tokens=1500, system=SYSTEM_PROMPT,
+        messages=nachrichten,
+    )
+    antwort = "".join(b.text for b in msg.content if b.type == "text")
+    return antwort, quellen, datensatz("frage", MODELL,
+                                       getattr(msg, "usage", None))
+
+
+# ----------------------------- Unterhaltungen -------------------------------
+
+def _coll_chats() -> str:
+    return "chats_" + _slug(st.session_state.get("kunde", "lokal"))
+
+
+def _coll_nutzung() -> str:
+    return "nutzung_" + _slug(st.session_state.get("kunde", "lokal"))
+
+
+def _sicherstellen(name: str):
+    from qdrant_client.models import Distance, VectorParams
+
+    c = qdrant()
+    if not c.collection_exists(name):
+        c.create_collection(collection_name=name,
+                            vectors_config=VectorParams(size=1,
+                                                        distance=Distance.COSINE))
+    return c
+
+
+def chats_laden() -> list[dict]:
+    try:
+        c = _sicherstellen(_coll_chats())
+        pts, _ = c.scroll(collection_name=_coll_chats(), limit=100,
+                          with_payload=True)
+        chats = [p.payload for p in pts]
+        return sorted(chats, key=lambda x: x.get("zuletzt", ""), reverse=True)
+    except Exception:  # noqa: BLE001
+        return st.session_state.get("_chats_lokal", [])
+
+
+def chat_speichern(chat: dict) -> None:
+    lokal = st.session_state.setdefault("_chats_lokal", [])
+    st.session_state["_chats_lokal"] = [c for c in lokal
+                                        if c.get("id") != chat["id"]] + [chat]
+    try:
+        from qdrant_client.models import PointStruct
+
+        c = _sicherstellen(_coll_chats())
+        c.upsert(collection_name=_coll_chats(),
+                 points=[PointStruct(id=chat["id"], vector=[0.0], payload=chat)])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def chat_loeschen(chat_id: str) -> None:
+    st.session_state["_chats_lokal"] = [
+        c for c in st.session_state.get("_chats_lokal", [])
+        if c.get("id") != chat_id
+    ]
+    try:
+        c = qdrant()
+        c.delete(collection_name=_coll_chats(), points_selector=[chat_id])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def nutzung_speichern(satz: dict) -> None:
+    st.session_state.setdefault("_nutzung_lokal", []).append(satz)
+    try:
+        import uuid as _uuid
+
+        from qdrant_client.models import PointStruct
+
+        c = _sicherstellen(_coll_nutzung())
+        c.upsert(collection_name=_coll_nutzung(),
+                 points=[PointStruct(id=str(_uuid.uuid4()), vector=[0.0],
+                                     payload=satz)])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def nutzung_laden() -> list[dict]:
+    try:
+        c = _sicherstellen(_coll_nutzung())
+        out, offset = [], None
+        while True:
+            pts, offset = c.scroll(collection_name=_coll_nutzung(), limit=500,
+                                   with_payload=True, offset=offset)
+            out.extend(p.payload for p in pts)
+            if offset is None:
+                return out
+    except Exception:  # noqa: BLE001
+        return st.session_state.get("_nutzung_lokal", [])
+
+
+def einstellungen_laden() -> dict:
+    try:
+        c = _sicherstellen("einstellungen_" + _slug(st.session_state.get("kunde", "lokal")))
+        pts = c.retrieve(
+            collection_name="einstellungen_" + _slug(st.session_state.get("kunde", "lokal")),
+            ids=[1], with_payload=True)
+        return dict(pts[0].payload) if pts else {}
+    except Exception:  # noqa: BLE001
+        return st.session_state.get("_einst_lokal", {})
+
+
+def einstellungen_speichern(daten: dict) -> None:
+    st.session_state["_einst_lokal"] = daten
+    try:
+        from qdrant_client.models import PointStruct
+
+        name = "einstellungen_" + _slug(st.session_state.get("kunde", "lokal"))
+        c = _sicherstellen(name)
+        c.upsert(collection_name=name,
+                 points=[PointStruct(id=1, vector=[0.0], payload=daten)])
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --------------------------------- Sidebar ----------------------------------
@@ -556,283 +814,458 @@ with st.sidebar:
 
     api_key = st.session_state.api_key
 
+    # ---- Unterhaltungen ------------------------------------------------
+    st.divider()
+    st.markdown('<div class="ln-section">Unterhaltungen</div>',
+                unsafe_allow_html=True)
+
+    if st.button("Neue Unterhaltung", type="primary", width="stretch"):
+        st.session_state["chat_id"] = None
+        st.session_state["history"] = []
+        st.rerun()
+
+    for _c in chats_laden()[:25]:
+        z1, z2 = st.columns([5, 1])
+        aktiv = _c.get("id") == st.session_state.get("chat_id")
+        if z1.button(("● " if aktiv else "") + (_c.get("titel") or "Ohne Titel")[:38],
+                     key=f"chat_{_c['id']}", width="stretch"):
+            st.session_state["chat_id"] = _c["id"]
+            st.session_state["history"] = _c.get("verlauf", [])
+            st.rerun()
+        if z2.button("✕", key=f"delchat_{_c['id']}", help="Unterhaltung löschen"):
+            chat_loeschen(_c["id"])
+            if aktiv:
+                st.session_state["chat_id"] = None
+                st.session_state["history"] = []
+            st.rerun()
+
+# --------------------------------- Reiter -----------------------------------
+
+from ln_nutzung import datensatz, render_nutzung  # noqa: E402
+
+tab_chat, tab_dok, tab_nutzung = st.tabs(["Chat", "Dokumente", "Nutzung"])
+
 # ------------------------------ Datenquellen --------------------------------
 
-st.markdown('<div class="ln-section">Dokumente verbinden</div>', unsafe_allow_html=True)
-tab_upload, tab_cloud = st.tabs(["Dateien hochladen", "Cloud verbinden"])
+with tab_dok:
+    st.markdown('<div class="ln-section">Dokumente verbinden</div>', unsafe_allow_html=True)
+    tab_upload, tab_cloud = st.tabs(["Dateien hochladen", "Cloud verbinden"])
 
-with tab_upload:
-    uploads = st.file_uploader(
-        "PDF, Word, Excel, CSV, Text oder Bilder/Scans (PNG, JPG) – mehrere gleichzeitig möglich",
-        type=["pdf", "docx", "xlsx", "xls", "txt", "md", "csv", "png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True,
-    )
-    if uploads and st.button("Hochgeladene Dateien indexieren", type="primary"):
-        try:
-            total = 0
-            prog = st.progress(0.0)
-            for i, up in enumerate(uploads, start=1):
-                n = index_document(up.name, up.getvalue(), quelle="Upload", api_key=api_key)
-                total += n
-                prog.progress(i / len(uploads), text=f"{up.name}: {n} Abschnitte")
-            st.success(f"Fertig – {total} Abschnitte aus {len(uploads)} Dateien indexiert.")
-            st.rerun()
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Indexierung fehlgeschlagen: {e}")
+    with tab_upload:
+        _m = st.session_state.pop("index_meldung", None)
+        if _m:
+            if _m["neu"] or _m["ersetzt"]:
+                st.success(
+                    f"{len(_m['neu']) + len(_m['ersetzt'])} Datei(en) indexiert, "
+                    f"{_m['total']} durchsuchbare Abschnitte."
+                )
+                for _n, _z in _m["neu"]:
+                    st.caption(f"neu · {_n} · {_z} Abschnitte")
+                for _n, _z in _m["ersetzt"]:
+                    st.caption(f"aktualisiert · {_n} · {_z} Abschnitte")
+            if _m["doppelt"]:
+                st.info(
+                    f"{len(_m['doppelt'])} Datei(en) übersprungen – gleicher "
+                    f"Inhalt ist schon im Index: "
+                    + ", ".join(f"{a} (wie {b})" for a, b in _m["doppelt"])
+                )
+            if _m["leer"]:
+                st.warning(
+                    "Kein Text gefunden in: " + ", ".join(_m["leer"])
+                    + ". Bei Scans hilft ein Bild statt eines leeren PDFs."
+                )
 
-def _drive_service():
-    """Google-Drive-Zugriff über den Service Account (Secrets oder lokale JSON)."""
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
-    creds = None
-    try:
-        if "gcp_service_account" in st.secrets:
-            creds = service_account.Credentials.from_service_account_info(
-                dict(st.secrets["gcp_service_account"]), scopes=scopes
-            )
-    except Exception:  # noqa: BLE001
-        pass
-    if creds is None:
-        keyfile = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./service-account.json")
-        creds = service_account.Credentials.from_service_account_file(keyfile, scopes=scopes)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-
-def _drive_folder_id(link_or_id: str) -> str:
-    import re
-
-    m = re.search(r"/folders/([A-Za-z0-9_-]+)", link_or_id)
-    return m.group(1) if m else link_or_id.strip()
-
-
-def _drive_walk(svc, folder_id: str, files: list, limit: int = 300) -> None:
-    """Sammelt rekursiv alle Dateien eines Drive-Ordners (inkl. Unterordner)."""
-    page_token = None
-    while True:
-        resp = svc.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id, name, mimeType)",
-            pageSize=100,
-            pageToken=page_token,
-        ).execute()
-        for f in resp.get("files", []):
-            if f["mimeType"] == "application/vnd.google-apps.folder":
-                _drive_walk(svc, f["id"], files, limit)
-            else:
-                files.append(f)
-            if len(files) >= limit:
-                return
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            return
-
-
-def _drive_download(svc, f: dict) -> tuple[str, bytes] | None:
-    """Lädt eine Drive-Datei; Google-Formate werden passend exportiert."""
-    mime = f["mimeType"]
-    if mime == "application/vnd.google-apps.document":
-        data = svc.files().export(fileId=f["id"], mimeType="text/plain").execute()
-        return f["name"] + ".txt", data
-    if mime == "application/vnd.google-apps.spreadsheet":
-        data = svc.files().export(
-            fileId=f["id"],
-            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ).execute()
-        return f["name"] + ".xlsx", data
-    if mime.startswith("application/vnd.google-apps"):
-        return None  # andere Google-Formate (Slides etc.) vorerst überspringen
-    return f["name"], svc.files().get_media(fileId=f["id"]).execute()
-
-
-with tab_cloud:
-    anbieter = st.radio(
-        "Cloud-Anbieter",
-        ["Google Drive", "Microsoft OneDrive"],
-        horizontal=True,
-    )
-    if anbieter.startswith("Microsoft"):
-        st.caption(
-            "Schritt 1: In OneDrive Rechtsklick auf den Ordner -> Teilen -> "
-            "Linkeinstellungen: 'Jeder, der über den Link verfügt' (Anzeigen) -> Link kopieren."
+        uploads = st.file_uploader(
+            "PDF, Word, Excel, CSV, Text oder Bilder/Scans (PNG, JPG) – mehrere gleichzeitig möglich",
+            type=["pdf", "docx", "xlsx", "xls", "txt", "md", "csv", "png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
         )
-        od_link = st.text_input("Schritt 2: OneDrive-Freigabelink einfügen")
-        if od_link and st.button("OneDrive-Ordner verbinden und indexieren", type="primary"):
-            import base64
-
-            import requests as _rq
-
-            def _od_share_id(url: str) -> str:
-                b = base64.urlsafe_b64encode(url.strip().encode()).decode().rstrip("=")
-                return "u!" + b
-
-            def _od_json(url: str) -> dict:
-                r = _rq.get(url, timeout=60)
-                if r.status_code != 200:
-                    raise RuntimeError(
-                        f"OneDrive-Fehler {r.status_code}. Ist der Link auf "
-                        f"'Jeder, der über den Link verfügt' gestellt? ({r.text[:150]})"
-                    )
-                return r.json()
-
-            def _od_children(share_id: str, path: str) -> list[dict]:
-                base = f"https://api.onedrive.com/v1.0/shares/{share_id}/driveItem"
-                url = base + (f":/{path}:/children" if path else "/children")
-                items: list[dict] = []
-                while url:
-                    data = _od_json(url)
-                    items.extend(data.get("value", []))
-                    url = data.get("@odata.nextLink")
-                return items
-
-            def _od_walk(share_id: str, path: str, files: list, limit: int = 300) -> None:
-                for it in _od_children(share_id, path):
-                    if "folder" in it:
-                        _od_walk(
-                            share_id,
-                            (path + "/" if path else "") + it["name"],
-                            files,
-                            limit,
-                        )
-                    else:
-                        files.append(it)
-                    if len(files) >= limit:
-                        return
-
+        if uploads and st.button("Hochgeladene Dateien indexieren",
+                                 type="primary", width="stretch"):
             try:
-                share_id = _od_share_id(od_link)
-                files: list = []
-                with st.spinner("Lese OneDrive-Ordner ..."):
-                    _od_walk(share_id, "", files)
-                if not files:
-                    st.warning("Keine Dateien gefunden - Link und Freigabe prüfen.")
-                else:
-                    total = 0
-                    prog = st.progress(0.0)
-                    for i, f in enumerate(files, start=1):
-                        dl = f.get("@microsoft.graph.downloadUrl") or f.get(
-                            "@content.downloadUrl"
-                        )
-                        if not dl:
-                            continue
-                        data = _rq.get(dl, timeout=120).content
-                        n = index_document(
-                            f["name"], data, quelle="OneDrive", api_key=api_key
-                        )
-                        total += n
-                        prog.progress(i / len(files), text=f"{f['name']}: {n} Abschnitte")
-                    st.success(
-                        f"Fertig - {total} Abschnitte aus {len(files)} OneDrive-Dateien indexiert."
-                    )
-                    st.rerun()
+                vorher = set(indexed_files())
+                total, neu, ersetzt, doppelt, leer = 0, [], [], [], []
+                prog = st.progress(0.0)
+                for i, up in enumerate(uploads, start=1):
+                    rohdaten = up.getvalue()
+                    schon_da = dublette(rohdaten, up.name)
+                    if schon_da:
+                        doppelt.append((up.name, schon_da))
+                        prog.progress(i / len(uploads),
+                                      text=f"{up.name}: bereits vorhanden")
+                        continue
+                    n = index_document(up.name, rohdaten, quelle="Upload",
+                                       api_key=api_key)
+                    total += n
+                    if n == 0:
+                        leer.append(up.name)
+                    elif up.name in vorher:
+                        ersetzt.append((up.name, n))
+                    else:
+                        neu.append((up.name, n))
+                    prog.progress(i / len(uploads),
+                                  text=f"{up.name}: {n} Abschnitte")
+                st.session_state["index_meldung"] = {
+                    "total": total, "neu": neu, "ersetzt": ersetzt,
+                    "doppelt": doppelt, "leer": leer,
+                }
+                st.rerun()
             except Exception as e:  # noqa: BLE001
-                st.error(f"OneDrive-Verbindung fehlgeschlagen: {e}")
-    else:
-        sa_email = ""
+                st.error(f"Indexierung fehlgeschlagen: {e}")
+
+    def _drive_service():
+        """Google-Drive-Zugriff über den Service Account (Secrets oder lokale JSON)."""
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+        creds = None
         try:
-            sa_email = dict(st.secrets.get("gcp_service_account", {})).get("client_email", "")
+            if "gcp_service_account" in st.secrets:
+                creds = service_account.Credentials.from_service_account_info(
+                    dict(st.secrets["gcp_service_account"]), scopes=scopes
+                )
         except Exception:  # noqa: BLE001
             pass
-        if sa_email:
-            st.caption(f"Schritt 1: Drive-Ordner freigeben für **{sa_email}** (als Betrachter).")
-        else:
-            st.caption(
-                "Schritt 1: In den Secrets den [gcp_service_account]-Block hinterlegen, "
-                "dann den Drive-Ordner für dessen E-Mail-Adresse freigeben."
-            )
-        drive_link = st.text_input(
-            "Schritt 2: Link des Drive-Ordners einfügen",
-            help="In Google Drive: Rechtsklick auf den Ordner -> Link abrufen -> hier einfügen.",
-        )
-        if drive_link and st.button("Drive-Ordner verbinden und indexieren", type="primary"):
-            try:
-                svc = _drive_service()
-                files: list = []
-                with st.spinner("Lese Ordnerinhalt ..."):
-                    _drive_walk(svc, _drive_folder_id(drive_link), files)
-                if not files:
-                    st.warning(
-                        "Keine Dateien gefunden. Ist der Ordner für den Service Account "
-                        "freigegeben und der Link korrekt?"
-                    )
+        if creds is None:
+            keyfile = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./service-account.json")
+            creds = service_account.Credentials.from_service_account_file(keyfile, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+    def _drive_folder_id(link_or_id: str) -> str:
+        import re
+
+        m = re.search(r"/folders/([A-Za-z0-9_-]+)", link_or_id)
+        return m.group(1) if m else link_or_id.strip()
+
+
+    def _drive_walk(svc, folder_id: str, files: list, limit: int = 300) -> None:
+        """Sammelt rekursiv alle Dateien eines Drive-Ordners (inkl. Unterordner)."""
+        page_token = None
+        while True:
+            resp = svc.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="nextPageToken, files(id, name, mimeType)",
+                pageSize=100,
+                pageToken=page_token,
+            ).execute()
+            for f in resp.get("files", []):
+                if f["mimeType"] == "application/vnd.google-apps.folder":
+                    _drive_walk(svc, f["id"], files, limit)
                 else:
-                    total = 0
-                    prog = st.progress(0.0)
-                    for i, f in enumerate(files, start=1):
-                        loaded = _drive_download(svc, f)
-                        if loaded is None:
-                            continue
-                        name, data = loaded
-                        n = index_document(name, data, quelle="Drive", api_key=api_key)
-                        total += n
-                        prog.progress(i / len(files), text=f"{name}: {n} Abschnitte")
-                    st.success(
-                        f"Fertig – {total} Abschnitte aus {len(files)} Drive-Dateien indexiert."
-                    )
-                    st.rerun()
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Drive-Verbindung fehlgeschlagen: {e}")
+                    files.append(f)
+                if len(files) >= limit:
+                    return
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                return
 
-# ------------------------ Indexierte Dokumente ------------------------------
 
-st.markdown('<div class="ln-section">Indexierte Dokumente</div>', unsafe_allow_html=True)
+    def _drive_download(svc, f: dict) -> tuple[str, bytes] | None:
+        """Lädt eine Drive-Datei; Google-Formate werden passend exportiert."""
+        mime = f["mimeType"]
+        if mime == "application/vnd.google-apps.document":
+            data = svc.files().export(fileId=f["id"], mimeType="text/plain").execute()
+            return f["name"] + ".txt", data
+        if mime == "application/vnd.google-apps.spreadsheet":
+            data = svc.files().export(
+                fileId=f["id"],
+                mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ).execute()
+            return f["name"] + ".xlsx", data
+        if mime.startswith("application/vnd.google-apps"):
+            return None  # andere Google-Formate (Slides etc.) vorerst überspringen
+        return f["name"], svc.files().get_media(fileId=f["id"]).execute()
 
-docs = indexed_files()
-if not docs:
-    st.caption("Noch keine Dokumente im Index – oben hochladen und indexieren.")
-else:
-    st.caption(f"{len(docs)} Dokument(e), {sum(docs.values())} durchsuchbare Abschnitte")
-    for src, n in docs.items():
-        c1, c2 = st.columns([6, 1])
-        c1.markdown(f"📄 **{src}**  \n<span style='color:#94a3b8;font-size:0.85rem;'>{n} Abschnitte</span>", unsafe_allow_html=True)
-        if c2.button("Entfernen", key=f"del_{src}"):
-            delete_source(src)
-            st.rerun()
 
-    if st.session_state.get("confirm_clear"):
-        st.warning("Wirklich ALLE Dokumente aus dem Index entfernen?")
-        cc1, cc2 = st.columns([1, 1])
-        if cc1.button("Ja, alle entfernen", type="primary"):
-            clear_all()
-            st.session_state.confirm_clear = False
-            st.rerun()
-        if cc2.button("Abbrechen"):
-            st.session_state.confirm_clear = False
-            st.rerun()
+    with tab_cloud:
+        anbieter = st.radio(
+            "Cloud-Anbieter",
+            ["Google Drive", "Microsoft OneDrive"],
+            horizontal=True,
+        )
+        if anbieter.startswith("Microsoft"):
+            st.caption(
+                "Schritt 1: In OneDrive Rechtsklick auf den Ordner -> Teilen -> "
+                "Linkeinstellungen: 'Jeder, der über den Link verfügt' (Anzeigen) -> Link kopieren."
+            )
+            od_link = st.text_input("Schritt 2: OneDrive-Freigabelink einfügen")
+            if od_link and st.button("OneDrive-Ordner verbinden und indexieren", type="primary"):
+                import base64
+
+                import requests as _rq
+
+                def _od_share_id(url: str) -> str:
+                    b = base64.urlsafe_b64encode(url.strip().encode()).decode().rstrip("=")
+                    return "u!" + b
+
+                def _od_json(url: str) -> dict:
+                    r = _rq.get(url, timeout=60)
+                    if r.status_code != 200:
+                        raise RuntimeError(
+                            f"OneDrive-Fehler {r.status_code}. Ist der Link auf "
+                            f"'Jeder, der über den Link verfügt' gestellt? ({r.text[:150]})"
+                        )
+                    return r.json()
+
+                def _od_children(share_id: str, path: str) -> list[dict]:
+                    base = f"https://api.onedrive.com/v1.0/shares/{share_id}/driveItem"
+                    url = base + (f":/{path}:/children" if path else "/children")
+                    items: list[dict] = []
+                    while url:
+                        data = _od_json(url)
+                        items.extend(data.get("value", []))
+                        url = data.get("@odata.nextLink")
+                    return items
+
+                def _od_walk(share_id: str, path: str, files: list, limit: int = 300) -> None:
+                    for it in _od_children(share_id, path):
+                        if "folder" in it:
+                            _od_walk(
+                                share_id,
+                                (path + "/" if path else "") + it["name"],
+                                files,
+                                limit,
+                            )
+                        else:
+                            files.append(it)
+                        if len(files) >= limit:
+                            return
+
+                try:
+                    share_id = _od_share_id(od_link)
+                    files: list = []
+                    with st.spinner("Lese OneDrive-Ordner ..."):
+                        _od_walk(share_id, "", files)
+                    if not files:
+                        st.warning("Keine Dateien gefunden - Link und Freigabe prüfen.")
+                    else:
+                        total = 0
+                        prog = st.progress(0.0)
+                        for i, f in enumerate(files, start=1):
+                            dl = f.get("@microsoft.graph.downloadUrl") or f.get(
+                                "@content.downloadUrl"
+                            )
+                            if not dl:
+                                continue
+                            data = _rq.get(dl, timeout=120).content
+                            n = index_document(
+                                f["name"], data, quelle="OneDrive", api_key=api_key
+                            )
+                            total += n
+                            prog.progress(i / len(files), text=f"{f['name']}: {n} Abschnitte")
+                        st.success(
+                            f"Fertig - {total} Abschnitte aus {len(files)} OneDrive-Dateien indexiert."
+                        )
+                        st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"OneDrive-Verbindung fehlgeschlagen: {e}")
+        else:
+            sa_email = ""
+            try:
+                sa_email = dict(st.secrets.get("gcp_service_account", {})).get("client_email", "")
+            except Exception:  # noqa: BLE001
+                pass
+            if sa_email:
+                st.caption(f"Schritt 1: Drive-Ordner freigeben für **{sa_email}** (als Betrachter).")
+            else:
+                st.caption(
+                    "Schritt 1: In den Secrets den [gcp_service_account]-Block hinterlegen, "
+                    "dann den Drive-Ordner für dessen E-Mail-Adresse freigeben."
+                )
+            drive_link = st.text_input(
+                "Schritt 2: Link des Drive-Ordners einfügen",
+                help="In Google Drive: Rechtsklick auf den Ordner -> Link abrufen -> hier einfügen.",
+            )
+            if drive_link and st.button("Drive-Ordner verbinden und indexieren", type="primary"):
+                try:
+                    svc = _drive_service()
+                    files: list = []
+                    with st.spinner("Lese Ordnerinhalt ..."):
+                        _drive_walk(svc, _drive_folder_id(drive_link), files)
+                    if not files:
+                        st.warning(
+                            "Keine Dateien gefunden. Ist der Ordner für den Service Account "
+                            "freigegeben und der Link korrekt?"
+                        )
+                    else:
+                        total = 0
+                        prog = st.progress(0.0)
+                        for i, f in enumerate(files, start=1):
+                            loaded = _drive_download(svc, f)
+                            if loaded is None:
+                                continue
+                            name, data = loaded
+                            n = index_document(name, data, quelle="Drive", api_key=api_key)
+                            total += n
+                            prog.progress(i / len(files), text=f"{name}: {n} Abschnitte")
+                        st.success(
+                            f"Fertig – {total} Abschnitte aus {len(files)} Drive-Dateien indexiert."
+                        )
+                        st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Drive-Verbindung fehlgeschlagen: {e}")
+
+    # ------------------------ Indexierte Dokumente ------------------------------
+
+    st.markdown('<div class="ln-section">Indexierte Dokumente</div>',
+                unsafe_allow_html=True)
+
+    docs = indexed_files()
+    if not docs:
+        st.caption("Noch keine Dokumente im Index – oben hochladen und indexieren.")
     else:
-        if st.button("🧹 Alle entfernen"):
+        st.caption(f"{len(docs)} Dokument(e), {sum(docs.values())} "
+                   f"durchsuchbare Abschnitte")
+
+        # Bei vielen Dokumenten ist eine ungefilterte Liste unbrauchbar.
+        such = st.text_input("Dokument suchen", placeholder="Name eingeben …",
+                             key="dok_suche")
+        treffer = {k: v for k, v in docs.items()
+                   if such.lower() in k.lower()} if such else docs
+
+        if st.session_state.get("confirm_clear"):
+            st.warning("Wirklich ALLE Dokumente aus dem Index entfernen?")
+            cc1, cc2 = st.columns(2)
+            if cc1.button("Ja, alle entfernen", type="primary", width="stretch"):
+                clear_all()
+                st.session_state.confirm_clear = False
+                st.rerun()
+            if cc2.button("Abbrechen", width="stretch"):
+                st.session_state.confirm_clear = False
+                st.rerun()
+        elif st.button(f"Alle {len(docs)} Dokumente entfernen"):
             st.session_state.confirm_clear = True
             st.rerun()
 
+        with st.expander(f"Liste anzeigen ({len(treffer)} von {len(docs)})",
+                         expanded=bool(such) or len(docs) <= 8):
+            for src, n in sorted(treffer.items()):
+                c1, c2 = st.columns([6, 1])
+                c1.markdown(
+                    f"📄 **{src}**  \n<span style='color:#94a3b8;"
+                    f"font-size:0.85rem;'>{n} Abschnitte</span>",
+                    unsafe_allow_html=True)
+                if c2.button("Entfernen", key=f"del_{src}"):
+                    delete_source(src)
+                    st.rerun()
+            if not treffer:
+                st.caption("Kein Dokument mit diesem Namen.")
+
 # --------------------------------- Chat -------------------------------------
 
-st.markdown('<div class="ln-section">Fragen stellen</div>', unsafe_allow_html=True)
+with tab_chat:
+    docs_alle = indexed_files()
 
-if "history" not in st.session_state:
-    st.session_state.history = []
+    if not docs_alle:
+        st.info("Noch keine Dokumente im Index. Im Reiter „Dokumente“ "
+                "hochladen oder eine Cloud verbinden.")
+    else:
+        k1, k2 = st.columns([3, 1])
+        nur = k1.multiselect(
+            "Nur in diesen Dokumenten suchen (leer = alle)",
+            sorted(docs_alle), placeholder="Alle Dokumente",
+        )
+        k2.caption(f"{len(docs_alle)} Dokument(e) · "
+                   f"{sum(docs_alle.values())} Abschnitte")
 
-for m in st.session_state.history:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
+    if "history" not in st.session_state:
+        st.session_state.history = []
+    if "chat_id" not in st.session_state:
+        st.session_state.chat_id = None
 
-question = st.chat_input("z.B. Was haben wir laut Rechnung X am Tag Y für Produkt Z gezahlt?")
-if question:
-    if not api_key:
-        st.error("Bitte zuerst links den Claude API-Key eintragen.")
-        st.stop()
-    st.session_state.history.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
-    with st.chat_message("assistant"):
-        with st.spinner("Durchsuche Dokumente ..."):
-            try:
-                answer, sources = ask_claude(question, api_key)
-                st.markdown(answer)
-                if sources:
-                    with st.expander("Verwendete Quellen"):
-                        for s in sources:
-                            st.markdown(f"- **{s['source']}** ({s['page']}, Relevanz {s['score']})")
-                st.session_state.history.append({"role": "assistant", "content": answer})
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Fehler: {e}")
+    for i, m in enumerate(st.session_state.history):
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+            if m.get("quellen"):
+                with st.expander(f"Belegstellen ({len(m['quellen'])})"):
+                    for s in m["quellen"]:
+                        st.markdown(
+                            f"**{s['source']}** · {s['page']} · "
+                            f"Relevanz {s['score']}")
+                        if s.get("text"):
+                            st.caption(s["text"].replace("\n", " ")[:500] + " …")
+
+    # Platzhalter VOR dem Eingabefeld: die neue Frage und die streamende
+    # Antwort werden hier hineingeschrieben und stehen damit an der
+    # richtigen Stelle, nicht unterhalb des Eingabefelds.
+    platz = st.container()
+
+    frage = st.chat_input("z.B. Was haben wir laut Rechnung X am Tag Y für "
+                          "Produkt Z gezahlt?")
+    if frage:
+        if not api_key:
+            st.error("Bitte zuerst links den Claude API-Key eintragen.")
+            st.stop()
+
+        st.session_state.history.append({"role": "user", "content": frage})
+        vorher = st.session_state.history[:-1]
+
+        with platz:
+            with st.chat_message("user"):
+                st.markdown(frage)
+            with st.chat_message("assistant"):
+                try:
+                    with st.spinner("Durchsuche Dokumente ..."):
+                        context, quellen, hinweis = belegstellen(
+                            frage, api_key, verlauf=vorher,
+                            nur_quellen=nur if docs_alle and nur else None,
+                        )
+                    if hinweis:
+                        st.markdown(hinweis)
+                        antwort, verbrauch = hinweis, datensatz("frage", MODELL, None)
+                    else:
+                        # Streaming: die Antwort erscheint Wort für Wort,
+                        # statt dass 20 Sekunden nur ein Spinner läuft.
+                        ergebnis: dict = {}
+                        antwort = st.write_stream(
+                            antwort_stream(frage, context, vorher, api_key,
+                                           ergebnis)
+                        )
+                        verbrauch = datensatz("frage", MODELL,
+                                              ergebnis.get("usage"))
+                        if quellen:
+                            with st.expander(f"Belegstellen ({len(quellen)})"):
+                                for s in quellen:
+                                    st.markdown(
+                                        f"**{s['source']}** · {s['page']} · "
+                                        f"Relevanz {s['score']}")
+                                    if s.get("text"):
+                                        st.caption(
+                                            s["text"].replace("\n", " ")[:500]
+                                            + " …")
+
+                    st.session_state.history.append(
+                        {"role": "assistant", "content": antwort,
+                         "quellen": quellen})
+                    nutzung_speichern(verbrauch)
+
+                    # Unterhaltung sichern. Titel ist die erste Frage – eine
+                    # KI-generierte Überschrift kostet Tokens und bringt
+                    # hier nichts.
+                    import uuid as _uuid
+
+                    if not st.session_state.chat_id:
+                        st.session_state.chat_id = str(_uuid.uuid4())
+                    chat_speichern({
+                        "id": st.session_state.chat_id,
+                        "titel": st.session_state.history[0]["content"][:60],
+                        "zuletzt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "verlauf": st.session_state.history,
+                    })
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Fehler: {e}")
+                    st.session_state.history.append(
+                        {"role": "assistant", "content": f"Fehler: {e}"})
+
+
+# -------------------------------- Nutzung -----------------------------------
+
+with tab_nutzung:
+    st.markdown('<div class="ln-section">Verbrauch und Kosten</div>',
+                unsafe_allow_html=True)
+    st.caption("Jede Frage und jede Indexierung verbraucht Tokens beim "
+               "KI-Anbieter. Die Zahlen stammen aus der Antwort der "
+               "Schnittstelle, nichts davon ist geschätzt.")
+    render_nutzung(nutzung_laden(), einstellungen_laden, einstellungen_speichern)
